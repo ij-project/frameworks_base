@@ -24,7 +24,6 @@ import static android.hardware.biometrics.BiometricRequestConstants.REASON_AUTH_
 import static android.hardware.biometrics.BiometricRequestConstants.REASON_AUTH_KEYGUARD;
 import static android.hardware.biometrics.BiometricRequestConstants.REASON_ENROLL_ENROLLING;
 import static android.hardware.biometrics.BiometricRequestConstants.REASON_ENROLL_FIND_SENSOR;
-import static android.hardware.biometrics.BiometricSourceType.FINGERPRINT;
 
 import static com.android.internal.util.LatencyTracker.ACTION_UDFPS_ILLUMINATE;
 import static com.android.internal.util.LatencyTracker.ACTION_UDFPS_OVERLAY_ATTACHED_AFTER_GOING_TO_SLEEP;
@@ -35,11 +34,9 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.res.Configuration;
 import android.graphics.Rect;
 import android.hardware.biometrics.BiometricFingerprintConstants;
 import android.hardware.biometrics.BiometricPrompt;
-import android.hardware.biometrics.BiometricSourceType;
 import android.hardware.biometrics.SensorProperties;
 import android.hardware.display.DisplayManager;
 import android.hardware.fingerprint.FingerprintManager;
@@ -53,7 +50,6 @@ import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
-import android.os.PowerManagerInternal;
 import android.os.Trace;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
@@ -65,6 +61,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityManager;
+import android.app.AxBoostFwk;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -74,13 +71,10 @@ import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.logging.InstanceId;
 import com.android.internal.util.LatencyTracker;
 import com.android.keyguard.KeyguardUpdateMonitor;
-import com.android.keyguard.KeyguardUpdateMonitorCallback;
 import com.android.keyguard.UserActivityNotifier;
-import com.android.server.LocalServices;
 import com.android.systemui.Dumpable;
 import com.android.systemui.Flags;
 import com.android.systemui.animation.ActivityTransitionAnimator;
-import com.android.systemui.biometrics.AuthController;
 import com.android.systemui.biometrics.MtkUdfpsScrimController;
 import com.android.systemui.biometrics.dagger.BiometricsBackground;
 import com.android.systemui.biometrics.domain.interactor.UdfpsOverlayInteractor;
@@ -202,11 +196,11 @@ public class UdfpsController implements DozeReceiver, Dumpable {
     @NonNull private final BrightnessMirrorShowingInteractor mBrightnessMirrorShowingInteractor;
     @NonNull private final CoroutineScope mScope;
     @NonNull private final InputManager mInputManager;
-    @NonNull private final AuthController mAuthController;
     @NonNull private final SelectedUserInteractor mSelectedUserInteractor;
     @NonNull private final MSDLPlayer mMsdlPlayer;
     private final boolean mIgnoreRefreshRate;
     private final KeyguardTransitionInteractor mKeyguardTransitionInteractor;
+    @NonNull private final AuthController mAuthController;
 
     // Currently the UdfpsController supports a single UDFPS sensor. If devices have multiple
     // sensors, this, in addition to a lot of the code here, will be updated.
@@ -243,16 +237,8 @@ public class UdfpsController implements DozeReceiver, Dumpable {
     private boolean mOnFingerDown;
     private boolean mAttemptedToDismissKeyguard;
     private final Set<Callback> mCallbacks = new HashSet<>();
-    PowerManagerInternal mPowerManagerInternal = LocalServices.getService(PowerManagerInternal.class);
 
     private boolean mUseMtkGhbmDimming;
-
-    private UdfpsAnimation mUdfpsAnimation;
-    private boolean mKeyguardCallbackRegistered = false;
-
-    private boolean mDisableSmartPixels;
-    private boolean mSmartPixelsFlag;
-    private boolean mSmartPixelsEnabled;
 
     @VisibleForTesting
     public static final VibrationAttributes UDFPS_VIBRATION_ATTRIBUTES =
@@ -275,9 +261,6 @@ public class UdfpsController implements DozeReceiver, Dumpable {
     private final ScreenLifecycle.Observer mScreenObserver = new ScreenLifecycle.Observer() {
         @Override
         public void onScreenTurnedOn() {
-            if (mDisableSmartPixels) {
-                isSmartPixelsEnabled();
-            }
             mScreenOn = true;
             if (mAodInterruptRunnable != null) {
                 mAodInterruptRunnable.run();
@@ -313,56 +296,6 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                 @Override
                 public void onViewDetachedFromWindow(@NonNull View v) {}
             };
-
-    private ConfigurationController.ConfigurationListener mConfigurationListener =
-            new ConfigurationController.ConfigurationListener() {
-                @Override
-                public void onThemeChanged() {
-                    updateUdfpsAnimation();
-                }
-
-                @Override
-                public void onUiModeChanged() {
-                    updateUdfpsAnimation();
-                }
-
-                @Override
-                public void onConfigChanged(Configuration newConfig) {
-                    updateUdfpsAnimation();
-                }
-            };
-
-    private final KeyguardUpdateMonitorCallback mKeyguardCallback = new KeyguardUpdateMonitorCallback() {
-        @Override
-        public void onBiometricAuthFailed(@NonNull BiometricSourceType type) {
-            if (type == FINGERPRINT && mOverlay != null) {
-                mFgExecutor.execute(() -> hideUdfpsAnimation());
-            }
-        }
-
-        @Override
-        public void onBiometricError(int msgId, String errString,
-                @NonNull BiometricSourceType type) {
-            if (type == FINGERPRINT && mOverlay != null) {
-                mFgExecutor.execute(() -> hideUdfpsAnimation());
-            }
-        }
-
-        @Override
-        public void onLockedOutStateChanged(@NonNull BiometricSourceType type) {
-            if (type == FINGERPRINT && mOverlay != null) {
-                mFgExecutor.execute(() -> hideUdfpsAnimation());
-            }
-        }
-
-        @Override
-        public void onBiometricAuthenticated(int userId, BiometricSourceType type,
-                boolean isStrongBiometric) {
-            if (mOverlay != null) {
-                mFgExecutor.execute(() -> hideUdfpsAnimation());
-            }
-        }
-    };
 
     @Override
     public void dump(@NonNull PrintWriter pw, @NonNull String[] args) {
@@ -427,12 +360,14 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             if (isUltrasonic()) {
                 if (acquiredInfo == FINGERPRINT_ACQUIRED_START) {
                     mFgExecutor.execute(() -> {
+                        mUdfpsOverlayInteractor.setFingerDown(true);
                         for (Callback cb : mCallbacks) {
                             cb.onFingerDown();
                         }
                     });
                 } else {
                     mFgExecutor.execute(() -> {
+                        mUdfpsOverlayInteractor.setFingerDown(false);
                         for (Callback cb : mCallbacks) {
                             cb.onFingerUp();
                         }
@@ -833,7 +768,17 @@ public class UdfpsController implements DozeReceiver, Dumpable {
         mUnlockedScreenOffAnimationController = unlockedScreenOffAnimationController;
         mLatencyTracker = latencyTracker;
         mActivityTransitionAnimator = activityTransitionAnimator;
-        mSensorProps = findFirstUdfps();
+        
+        mAuthController = authController;
+
+        FingerprintSensorPropertiesInternal udfpsProps = findUdfpsProps();
+        mSensorProps = udfpsProps != null ? udfpsProps : new FingerprintSensorPropertiesInternal(
+                -1 /* sensorId */,
+                SensorProperties.STRENGTH_CONVENIENCE,
+                0 /* maxEnrollmentsPerUser */,
+                new ArrayList<>() /* componentInfo */,
+                FingerprintSensorProperties.TYPE_UNKNOWN,
+                false /* resetLockoutRequiresHardwareAuthToken */);
 
         mBiometricExecutor = biometricsExecutor;
         mPrimaryBouncerInteractor = primaryBouncerInteractor;
@@ -855,8 +800,6 @@ public class UdfpsController implements DozeReceiver, Dumpable {
         mMsdlPlayer = msdlPlayer;
 
         mDumpManager.registerDumpable(TAG, this);
-
-        mAuthController = authController;
 
         mOrientationListener = new BiometricDisplayListener(
                 context,
@@ -887,51 +830,17 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             mWakefulnessLifecycle.addObserver(mWakefulnessLifecycleObserver);
         }
 
-        mDisableSmartPixels = mContext.getResources().getBoolean(com.android.systemui.res.R.bool.config_disableSmartPixelsOnUDFPS);
-
         mUseMtkGhbmDimming = mContext.getResources().getBoolean(
             com.android.systemui.res.R.bool.config_udfpsMtkGhbmDimming);
-
-        if (com.android.internal.util.infinity.Utils.isPackageInstalled(mContext,
-                "com.infinity.udfps.animations")) {
-            updateUdfpsAnimation();
-            mConfigurationController.addCallback(mConfigurationListener);
-        }
     }
 
-    private void updateUdfpsAnimation() {
-        if (mUdfpsAnimation != null) {
-            mUdfpsAnimation.removeAnimation();
-            mUdfpsAnimation = null;
+    @Nullable
+    private FingerprintSensorPropertiesInternal findUdfpsProps() {
+        if (mAuthController != null && mAuthController.getUdfpsProps() != null 
+                && !mAuthController.getUdfpsProps().isEmpty()) {
+            return mAuthController.getUdfpsProps().get(0);
         }
-        mUdfpsAnimation = new UdfpsAnimation(mContext, mWindowManager, mSensorProps, mAuthController);
-        if (mUdfpsAnimation != null) {
-            mUdfpsAnimation.updatePosition();
-        }
-    }
-
-    private void isSmartPixelsEnabled() {
-        if (!mSmartPixelsFlag) {
-            mSmartPixelsEnabled = Settings.Secure.getIntForUser(
-                    mContext.getContentResolver(), Settings.Secure.SMART_PIXEL_FILTER_ENABLED,
-                    0, mContext.getUserId()) != 0;
-        }
-    }
-
-    private void disableSmartPixels() {
-        if (mSmartPixelsEnabled) {
-            Settings.Secure.putIntForUser(mContext.getContentResolver(),
-                    Settings.Secure.SMART_PIXEL_FILTER_ENABLED,
-                    0, mContext.getUserId());
-        }
-    }
-
-    private void enableSmartPixels() {
-        if (mSmartPixelsEnabled) {
-            Settings.Secure.putIntForUser(mContext.getContentResolver(),
-                    Settings.Secure.SMART_PIXEL_FILTER_ENABLED,
-                    1, mContext.getUserId());
-        }
+        return null;
     }
 
     /**
@@ -950,17 +859,6 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                         + "vibration. Either the controller overlay is null or has no view");
             }
         }
-    }
-
-    @Nullable
-    private FingerprintSensorPropertiesInternal findFirstUdfps() {
-        for (FingerprintSensorPropertiesInternal props :
-                mFingerprintManager.getSensorPropertiesInternal()) {
-            if (props.isAnyUdfpsType()) {
-                return props;
-            }
-        }
-        return null;
     }
 
     @Override
@@ -986,11 +884,6 @@ public class UdfpsController implements DozeReceiver, Dumpable {
 
         mOverlay = overlay;
         final int requestReason = overlay.getRequestReason();
-
-        if (mUdfpsAnimation != null) {
-            mUdfpsAnimation.setIsKeyguard(requestReason == REASON_AUTH_KEYGUARD);
-        }
-
         if (requestReason == REASON_AUTH_KEYGUARD
                 && !mKeyguardUpdateMonitor.isFingerprintDetectionRunning()) {
             Log.d(TAG, "Attempting to showUdfpsOverlay when fingerprint detection"
@@ -1004,17 +897,13 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             mOnFingerDown = false;
             mAttemptedToDismissKeyguard = false;
             mOrientationListener.enable();
+            
             if (mFingerprintManager != null) {
                 mFingerprintManager.onUdfpsUiEvent(FingerprintManager.UDFPS_UI_OVERLAY_SHOWN,
                         overlay.getRequestId(), mSensorProps.sensorId);
             }
         } else {
             Log.d(TAG, "showUdfpsOverlay | the overlay is already showing");
-        }
-
-        if (!mKeyguardCallbackRegistered) {
-            mKeyguardUpdateMonitor.registerCallback(mKeyguardCallback);
-            mKeyguardCallbackRegistered = true;
         }
     }
 
@@ -1037,16 +926,11 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             }
 
             final boolean removed = mOverlay.hide();
+            mUdfpsOverlayInteractor.setFingerDown(false);
             mKeyguardViewManager.hideAlternateBouncer(true);
-            hideUdfpsAnimation();
             Log.v(TAG, "hideUdfpsOverlay | removing window: " + removed);
         } else {
             Log.v(TAG, "hideUdfpsOverlay | the overlay is already hidden");
-        }
-
-        if (mKeyguardCallbackRegistered) {
-            mKeyguardUpdateMonitor.removeCallback(mKeyguardCallback);
-            mKeyguardCallbackRegistered = false;
         }
 
         mOverlay = null;
@@ -1133,7 +1017,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                 && Settings.Secure.getIntForUser(
                         mContext.getContentResolver(),
                         Settings.Secure.SCREEN_OFF_UNLOCK_UDFPS_ENABLED,
-                        mContext.getResources().getBoolean(R.bool.config_screen_off_udfps_default_on) ? 1 : 0,
+                        0,
                         mContext.getUserId()) != 0;
     }
 
@@ -1242,26 +1126,10 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                     + " current: " + mOverlay.getRequestId());
             return;
         }
-        if (mDisableSmartPixels) {
-            if (!mSmartPixelsFlag && mSmartPixelsEnabled) {
-                disableSmartPixels();
-            }
-            mSmartPixelsFlag = true;
-        }
-        
-        final View view = mOverlay.getTouchOverlay();
-
-        if (mPowerManagerInternal != null) {
-            mPowerManagerInternal.setPowerMode(PowerManagerInternal.MODE_LAUNCH, true);
-        }
-
-        if (view != null && view.getViewRootImpl() != null) {
-            view.getViewRootImpl().notifyRendererOfExpensiveFrame();
-        }
-        
         if (isOptical()) {
             mLatencyTracker.onActionStart(ACTION_UDFPS_ILLUMINATE);
         }
+        AxBoostFwk.acquireHint(AxBoostFwk.OP_FIRST_LAUNCH_BOOST, -1L);
         // Refresh screen timeout and boost process priority if possible.
         if (Flags.bouncerUiRevamp()) {
             mUserActivityNotifier.notifyUserActivity(mSystemClock.uptimeMillis(),
@@ -1277,6 +1145,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             mDeviceEntryFaceAuthInteractor.onUdfpsSensorTouched();
         }
         mOnFingerDown = true;
+        mUdfpsOverlayInteractor.setFingerDown(true);
         mFingerprintManager.onPointerDown(requestId, mSensorProps.sensorId, pointerId, x, y,
                 minor, major, orientation, time, gestureStart, isAod);
 
@@ -1305,6 +1174,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
 
         Trace.endAsyncSection("UdfpsController.e2e.onPointerDown", 0);
 
+        final View view = mOverlay.getTouchOverlay();
         if (isOptical() && view instanceof UdfpsTouchOverlay udfpsView) {
             if (mIgnoreRefreshRate) {
                 dispatchOnUiReady(requestId);
@@ -1313,16 +1183,11 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             }
         }
 
-        if (view != null && view.getViewRootImpl() != null) {
-            view.getViewRootImpl().notifyRendererOfExpensiveFrame();
-        }
-
         if (isOptical()) {
             for (Callback cb : mCallbacks) {
                 cb.onFingerDown();
             }
         }
-        showUdfpsAnimation();
     }
 
     private void onFingerUp(long requestId, @NonNull View view) {
@@ -1352,17 +1217,10 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             long time,
             long gestureStart,
             boolean isAod) {
+        AxBoostFwk.acquireHint(AxBoostFwk.OP_FIRST_LAUNCH_BOOST, 0L);
         mExecution.assertIsMainThread();
         mActivePointerId = MotionEvent.INVALID_POINTER_ID;
         mAcquiredReceived = false;
-
-        if (mDisableSmartPixels) {
-            if (mSmartPixelsFlag && mSmartPixelsEnabled) {
-                enableSmartPixels();
-            }
-            mSmartPixelsFlag = false;
-        }
-
         if (mOnFingerDown) {
             mFingerprintManager.onPointerUp(requestId, mSensorProps.sensorId, pointerId, x,
                     y, minor, major, orientation, time, gestureStart, isAod);
@@ -1371,9 +1229,9 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                     cb.onFingerUp();
                 }
             }
-            hideUdfpsAnimation();
         }
         mOnFingerDown = false;
+        mUdfpsOverlayInteractor.setFingerDown(false);
 
         if (mUseMtkGhbmDimming && mOverlay != null) {
             View hbmView = mOverlay.getHbmView();
@@ -1384,26 +1242,6 @@ public class UdfpsController implements DozeReceiver, Dumpable {
 
         unconfigureDisplay(view);
         cancelAodSendFingerUpAction();
-        if (mPowerManagerInternal != null) {
-            mPowerManagerInternal.setPowerMode(PowerManagerInternal.MODE_LAUNCH, false);
-        }
-
-    }
-
-    public boolean isAnimationEnabled() {
-        return mUdfpsAnimation != null && mUdfpsAnimation.isAnimationEnabled();
-    }
-
-    private void showUdfpsAnimation() {
-        if (mUdfpsAnimation != null) {
-            mUdfpsAnimation.show();
-        }
-    }
-
-    private void hideUdfpsAnimation() {
-        if (mUdfpsAnimation != null) {
-            mUdfpsAnimation.hide();
-        }
     }
 
     /**
